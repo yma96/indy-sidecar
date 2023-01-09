@@ -6,6 +6,9 @@ quarkus:
 #      certificate:
 #        file: /deployments/ssl/tls.crt
 #        key-file: /deployments/ssl/tls.key
+    # Make defaults protocols to TLS v1.2 if ssl enables,
+    # this will bring better version compatibility support for current npm build.
+#      protocols: TLSv1.2
     port: 8080
     read-timeout: 30m
     limits:
