@@ -29,7 +29,7 @@ public interface TrackingService
 {
     @GET
     @Path( "/{id}/artifactRecord/{path: (.*)}" )
-    Response recordArtificat( final @PathParam( "id" ) String id, final @PathParam( "path" ) String path,
+    Response recordArtifact( final @PathParam( "id" ) String id, final @PathParam( "path" ) String path,
                               final @QueryParam( "packageType" ) String packageType,
                               final @QueryParam( "type" ) String type, final @QueryParam( "name" ) String name,
                               final @QueryParam( "originalUrl" ) String originalUrl,

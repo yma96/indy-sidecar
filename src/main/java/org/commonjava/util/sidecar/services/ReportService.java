@@ -124,7 +124,7 @@ public class ReportService
         boolean exception = false;
         try
         {
-            Response response = trackingService.recordArtificat( trackingId, trackingPath, storeKey.getPackageType(),
+            Response response = trackingService.recordArtifact( trackingId, trackingPath, storeKey.getPackageType(),
                                                                  storeKey.getType().name(), storeKey.getName(),
                                                                  originalUrl, entryDTO.getSize(), entryDTO.getMd5(),
                                                                  entryDTO.getSha1(), entryDTO.getSha256() );
