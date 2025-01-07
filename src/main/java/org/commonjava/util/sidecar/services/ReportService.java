@@ -145,7 +145,10 @@ public class ReportService
                 Quarkus.asyncExit();
             }
         }
-
     }
 
+    public HashMap<String, HistoricalEntryDTO> getHistoricalContentMap()
+    {
+        return historicalContentMap;
+    }
 }

@@ -21,6 +21,7 @@ import io.vertx.core.http.HttpServerRequest;
 import kotlin.Pair;
 import org.commonjava.util.sidecar.config.ProxyConfiguration;
 import org.commonjava.util.sidecar.interceptor.ExceptionHandler;
+import org.commonjava.util.sidecar.model.dto.HistoricalEntryDTO;
 import org.commonjava.util.sidecar.util.OtelAdapter;
 import org.commonjava.util.sidecar.util.ProxyStreamingOutput;
 import org.commonjava.util.sidecar.util.UrlUtils;
@@ -31,7 +32,11 @@ import org.slf4j.LoggerFactory;
 import javax.enterprise.context.ApplicationScoped;
 import javax.inject.Inject;
 import javax.ws.rs.core.Response;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 import static io.vertx.core.http.HttpMethod.HEAD;
 import static javax.ws.rs.core.Response.Status.INTERNAL_SERVER_ERROR;
@@ -54,28 +59,34 @@ public class ProxyService
     @Inject
     OtelAdapter otel;
 
+    @Inject
+    ReportService reportService;
+
     public Uni<Response> doHead( String trackingId, String packageType, String type, String name, String path,
-                                 HttpServerRequest request ) throws Exception
+                                 HttpServerRequest request )
+            throws Exception
     {
         String contentPath = UrlUtils.buildUrl( FOLO_TRACK_REST_BASE_PATH, trackingId, packageType, type, name, path );
         return doHead( contentPath, request );
     }
 
-    public Uni<Response> doHead( String path, HttpServerRequest request ) throws Exception
+    public Uni<Response> doHead( String path, HttpServerRequest request )
+            throws Exception
     {
         return normalizePathAnd( path, p -> classifier.classifyAnd( p, request, ( client, service ) -> wrapAsyncCall(
-                        client.head( p, request ).call(), request.method() ) ) );
+                client.head( p, request ).call(), request.method() ) ) );
     }
 
     public Uni<Response> doGet( String trackingId, String packageType, String type, String name, String path,
-                                HttpServerRequest request ) throws Exception
+                                HttpServerRequest request )
+            throws Exception
     {
         String contentPath = UrlUtils.buildUrl( FOLO_TRACK_REST_BASE_PATH, trackingId, packageType, type, name, path );
         return doGet( contentPath, request );
     }
 
     public Uni<Response> doGet( String path, HttpServerRequest request )
-                    throws Exception
+            throws Exception
     {
         return normalizePathAnd( path, p -> classifier.classifyAnd( p, request, ( client, service ) -> wrapAsyncCall(
                 client.get( p, request ).call(), request.method() ) ) );
@@ -113,14 +124,85 @@ public class ProxyService
     public Uni<Response> doDelete( String path, HttpServerRequest request ) throws Exception
     {
         return normalizePathAnd( path, p -> classifier.classifyAnd( p, request, ( client, service ) -> wrapAsyncCall(
-                        client.delete( p ).headersFrom( request ).call(), request.method() ) ) );
+                client.delete( p ).headersFrom( request ).call(), request.method() ) ) );
     }
 
     public Uni<Response> wrapAsyncCall( WebClientAdapter.CallAdapter asyncCall, HttpMethod method )
     {
-        Uni<Response> ret =
-                        asyncCall.enqueue().onItem().transform( ( resp ) -> convertProxyResp( resp, method ) );
+        Uni<Response> ret = asyncCall.enqueue().onItem().transform( ( resp ) -> convertProxyResp( resp, method ) );
         return ret.onFailure().recoverWithItem( this::handleProxyException );
+    }
+
+    public Uni<Boolean> validateChecksum( String trackingId, String packageType, String type, String name, String path,
+                                          HttpServerRequest request )
+    {
+        Map<String, String> localChecksums = getChecksums( path );
+        Uni<Boolean> resultUni = Uni.createFrom().item( false );
+
+        for ( String checksumType : localChecksums.keySet() )
+        {
+            String localChecksum = localChecksums.get( checksumType );
+            if ( localChecksum == null )
+            {
+                continue;
+            }
+            String checksumUrl = path + "." + checksumType;
+            resultUni = resultUni.onItem().call( () -> {
+                try
+                {
+                    return downloadAndCompareChecksum( trackingId, packageType, type, name, checksumUrl, localChecksum,
+                                                       request ).onItem().invoke( result -> {
+                        if ( result != null && result )
+                        {
+                            // This is just used to skip loop to avoid unnecessary checksum download
+                            logger.debug(
+                                    "Found the valid checksum compare result, stopping further checks, remote path {}",
+                                    checksumUrl );
+                            throw new FoundValidChecksumException();
+                        }
+                    } );
+                }
+                catch ( Exception e )
+                {
+                    logger.error( "Checksum download compare error for path: {}", checksumUrl, e );
+                }
+                return null;
+            } );
+        }
+        return resultUni.onFailure().recoverWithItem( false ).onItem().transform( result -> {
+            // If catch FoundValidChecksumException，return true
+            return true;
+        } ); // If no valid checksum compare result found, return false
+    }
+
+    private Uni<Boolean> downloadAndCompareChecksum( String trackingId, String packageType, String type, String name,
+                                                     String checksumUrl, String localChecksum,
+                                                     HttpServerRequest request )
+            throws Exception
+    {
+        return doGet( trackingId, packageType, type, name, checksumUrl, request ).onItem().transform( response -> {
+            if ( response.getStatus() == Response.Status.OK.getStatusCode() )
+            {
+                ProxyStreamingOutput streamingOutput = (ProxyStreamingOutput) response.getEntity();
+                try (ByteArrayOutputStream outputStream = new ByteArrayOutputStream())
+                {
+                    streamingOutput.write( outputStream );
+                    String remoteChecksum = outputStream.toString();
+                    return localChecksum.equals( remoteChecksum );
+                }
+                catch ( IOException e )
+                {
+                    logger.error( "Error to read remote checksum, path:{}.", checksumUrl, e );
+                    return null;
+                }
+            }
+            else
+            {
+                logger.error( "Failed to download remote checksum for {}: HTTP {}.", checksumUrl,
+                              response.getStatus() );
+                return null;
+            }
+        } );
     }
 
     /**
@@ -161,5 +243,47 @@ public class ProxyService
         }
         String key = header.getFirst();
         return !FORBIDDEN_HEADERS.contains( key.toLowerCase() );
+    }
+
+    private Map<String, String> getChecksums( String path )
+    {
+        Map<String, String> result = new LinkedHashMap<>();
+        HistoricalEntryDTO entryDTO = reportService.getHistoricalContentMap().get( path );
+        if ( entryDTO != null )
+        {
+            result.put( ChecksumType.SHA1.getValue(), entryDTO.getSha1() );
+            result.put( ChecksumType.SHA256.getValue(), entryDTO.getSha256() );
+            result.put( ChecksumType.MD5.getValue(), entryDTO.getMd5() );
+        }
+
+        return result;
+    }
+
+    enum ChecksumType
+    {
+        SHA1( "sha1" ),
+        SHA256( "sha256" ),
+        MD5( "md5" );
+
+        private final String value;
+
+        ChecksumType( String value )
+        {
+            this.value = value;
+        }
+
+        public String getValue()
+        {
+            return value;
+        }
+    }
+
+    class FoundValidChecksumException
+            extends RuntimeException
+    {
+        public FoundValidChecksumException()
+        {
+            super( "Found a valid checksum, stopping further checks." );
+        }
     }
 }

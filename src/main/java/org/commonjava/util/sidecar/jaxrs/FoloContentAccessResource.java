@@ -41,6 +41,7 @@ import javax.ws.rs.QueryParam;
 import javax.ws.rs.core.Context;
 import javax.ws.rs.core.Response;
 import java.io.File;
+import java.io.IOException;
 import java.io.InputStream;
 import java.util.Optional;
 
@@ -87,11 +88,39 @@ public class FoloContentAccessResource
         Optional<File> download = archiveService.getLocally( path );
         if ( download.isPresent() && download.get().isFile() )
         {
-            InputStream inputStream = FileUtils.openInputStream( download.get() );
-            final Response.ResponseBuilder builder = Response.ok( new TransferStreamingOutput( inputStream ) );
-            logger.debug( "Download path: {} from historical archive.", path );
-            publishTrackingEvent( path, id );
-            return Uni.createFrom().item( builder.build() );
+            Uni<Boolean> checksumValidation =
+                    proxyService.validateChecksum( id, packageType, type, name, path, request );
+            return checksumValidation.onItem().transform( result -> {
+                if ( result != null && result )
+                {
+                    try
+                    {
+                        InputStream inputStream = FileUtils.openInputStream( download.get() );
+                        final Response.ResponseBuilder builder =
+                                Response.ok( new TransferStreamingOutput( inputStream ) );
+                        logger.debug( "Download path: {} from historical archive.", path );
+                        publishTrackingEvent( path, id );
+                        return Uni.createFrom().item( builder.build() );
+                    }
+                    catch ( IOException e )
+                    {
+                        logger.error( "IO error for local file, path {}.", path, e );
+                    }
+                }
+                else
+                {
+                    try
+                    {
+                        logger.debug( "Checksum validation failed, download from proxy: {}.", path );
+                        return proxyService.doGet( id, packageType, type, name, path, request );
+                    }
+                    catch ( Exception e )
+                    {
+                        logger.error( "Error for proxy download, path {}.", path, e );
+                    }
+                }
+                return null;
+            } ).flatMap( response -> response );
         }
         else
         {
